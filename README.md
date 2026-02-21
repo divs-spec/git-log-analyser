@@ -1,1 +1,1 @@
-# gits-and-log-analyser
+# git-log-analyser

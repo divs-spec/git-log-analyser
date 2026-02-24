@@ -1,0 +1,129 @@
+
+from datetime import datetime
+import logging
+
+import chromadb
+from dynaconf import Dynaconf
+from git import Repo, NULL_TREE
+import sys
+
+
+from sentence_transformers import SentenceTransformer
+import typer
+from pprint import pformat
+
+# Setup logging.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s -\
+%(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+settings = Dynaconf(
+    settings_files=["settings.toml"],
+    environments=True,
+    default_env="default",
+)
+
+# Load typer.
+app = typer.Typer(
+    help="A tool to process git commits and embed them into a \
+        ChromaDB for fast retrieval."
+)
+
+
+def chunk_git_commits(no_of_commits: int, branch: str, git_repo_dir: str):
+    """Go to a repo, checkout a branch and return a list of n commits.
+
+    Args:
+        no_of_commits (int): No. of commits.
+        branch (str): Name of git branch.
+        git_repo_dir (str): location of git repo.
+
+    Returns:
+        list: list of dictionarys containing commit data with field such as:
+               - hexsha
+               - author
+               - msg
+               - commited_date
+    """
+    repo = Repo(git_repo_dir)
+    commits = list(repo.iter_commits(branch, max_count=no_of_commits))
+
+    chunks = []
+
+    for commit in commits:
+
+        # Diffs are massive. They cannot fit into the prompt so the we only
+        # add the commit message and metadata.
+
+        # parent = commit.parents[0] if commit.parents else NULL_TREE
+        # diffs = commit.diff(parent, create_patch=True)
+
+        # diff_text = "\n".join(d.diff.decode("utf-8", errors="ignore") for d in diffs)
+
+        files_modified = list(commit.stats.files.keys())
+        files_modified_str = "\n+".join(files_modified)
+
+        stats = commit.stats.total
+        stats_str = pformat(stats)
+
+        # Join all diffs as text
+        ts_epoch = commit.committed_date
+        ts = datetime.fromtimestamp(ts_epoch).strftime('%Y-%m-%d %H:%M:%S')
+        commit_dict = {
+            "hexsha": commit.hexsha,
+            "author": commit.author.name,
+            "msg": commit.message + files_modified_str + f"statistics={stats_str}",
+            "committed_date": ts,
+        }
+        chunks.append(commit_dict)
+
+    return chunks
+
+
+@app.command()
+def add_to_chromadb(
+    local_chromadb_store: str = typer.Option("./chroma_store",
+                                             help="Path to local store."),
+    collection_name: str = typer.Option(settings.collection_name,
+                                        help="A helpful name for collection."),
+    git_repo_dir: str = typer.Option(settings.git_repo_dir,
+                                     help="Location of git repo."),
+    no_of_commits: int = typer.Option(settings.no_of_commits,
+                                      help="No. of chunks."),
+    branch: str = typer.Option(settings.branch,
+                               help="Name of branch.")
+):
+    """Chunks all n commits and inserts them to a chromaDB."""
+
+    logger.info("*** Creating chunks from logs based on pipeline stages...")
+    chunks = chunk_git_commits(no_of_commits, branch, git_repo_dir)
+    logger.info("*** Done")
+
+    # Initialize ChromaDB client (local store)
+    chroma_client = chromadb.PersistentClient(path=local_chromadb_store)
+
+    # Create or get the collection
+    collection = chroma_client.get_or_create_collection(name=collection_name)
+
+    # Load the embedding model
+    model = SentenceTransformer("all-MiniLM-L6-v2")  # small and fast
+
+    logger.info(f"*** Embed and add chunks to \"{local_chromadb_store}\"")
+    # Embed and add to ChromaDB
+    for idx, chunk in enumerate(chunks):
+        embedding = model.encode(chunk["msg"]).tolist()
+        collection.add(
+            documents=[pformat(chunk)],
+            embeddings=[embedding],
+            metadatas=[{
+                "author": chunk["author"],
+                "committed_date": chunk["committed_date"],
+                "hexsha": chunk["hexsha"]
+            }],
+            ids=[f"commit_{idx}_{chunk['hexsha']}"]
+        )
+    logger.info("*** Done")
+
+
+if __name__ == "__main__":
+    app()
